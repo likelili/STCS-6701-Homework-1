@@ -1,0 +1,538 @@
+---
+title: "PMML HW1 Code"
+output: html_notebook
+---
+
+## Question 3
+
+### Import Package
+
+```{r}
+
+# Install if needed
+install.packages("MCMCpack")
+install.packages('gtools')
+# Load package
+library(MCMCpack)
+
+install.packages("extraDistr")   # if not installed
+library(extraDistr)
+
+library(coda)
+library(gtools)
+
+```
+
+### Generate data
+
+```{r Data,echo=FALSE}
+
+set.seed(123)
+
+# ----- Priors & truth -----
+K <- 5
+N <- 1000
+
+alpha <- c(0.5, 1, 2, 3, 5)       # Dirichlet weights prior
+m0 <- 1; kappa0 <- 0.25         # Normal prior hyperparam
+a0 <- 10; b0 <- 2             # Gamma(shape-rate) prior for precision
+
+# sample true weights & component params
+pi_true <- as.vector(rdirichlet(1, alpha)); pi_true
+lambda_true <- rgamma(K, shape = a0, rate = b0); lambda_true
+mu_true <- rnorm(K, mean = m0, sd = sqrt(1/(kappa0*lambda_true))); mu_true
+
+# sample labels and observations
+z <- sample.int(K, size = N, replace = TRUE, prob = pi_true)
+x <- rnorm(N, mean = mu_true[z], sd = sqrt(1/lambda_true[z]))
+
+# quick check plot
+plot(x, pch=19, col=z)
+
+
+```
+
+### Blocked Gibbs
+
+```{r}
+blocked_gibbs <- function(x, K, alpha, m0, kappa0, a0, b0, 
+                          n_iter = 2000, burn_in = 1000) {
+  
+  N <- length(x)
+  total_iter <- n_iter + burn_in
+  
+  # --- initialization ---
+  z <- sample.int(K, N, replace = TRUE)
+  Nk <- tabulate(z, K)
+  pi <- as.vector(rdirichlet(1, alpha))
+  lambda <- rgamma(K, shape = a0, rate = b0 )  
+  mu <- rnorm(K, m0, sqrt(1/(kappa0 * lambda)))
+  
+  # --- storage only after burn-in ---
+  keep <- list(pi = matrix(NA, n_iter, K),
+               mu = matrix(NA, n_iter, K),
+               lambda = matrix(NA, n_iter, K),
+               z = matrix(NA, n_iter, N))
+  
+  store_idx <- 0
+  
+  for (t in 1:total_iter) {
+    # --- update pi ---
+    Nk <- tabulate(z, K)
+    pi <- as.vector(rdirichlet(1, alpha + Nk))
+    
+    # --- update mu & lambda for each component ---
+    for (k in 1:K) {
+      idx <- which(z == k)
+      nk <- length(idx)
+      if (nk > 0) {
+        xk <- x[idx]
+        xbar <- mean(xk)
+      } else {
+        xk <- numeric(0); xbar <- 0
+      }
+      kappa_k <- kappa0 + nk
+      m_k <- (kappa0 * m0 + nk * xbar) / kappa_k
+      
+      # mu | lambda
+      mu[k] <- rnorm(1, mean = m_k, sd = sqrt(1/(kappa_k * lambda[k])))
+      
+      # lambda | mu
+      ss <- if (nk > 0) sum((xk - mu[k])^2) else 0.0
+      rate_k <- b0 + 0.5 * (ss + kappa0 * (mu[k] - m0)^2)
+      lambda[k] <- rgamma(1, shape = a0 + nk/2, rate = rate_k)
+    }
+    
+    # --- update z ---
+    logw <- matrix(NA, N, K)
+    for (k in 1:K) {
+      logw[, k] <- log(pi[k]) + dnorm(x, mean = mu[k], sd = sqrt(1/lambda[k]), log = TRUE)
+    }
+    logw <- logw - apply(logw, 1, max)
+    w <- exp(logw)
+    w <- w / rowSums(w)
+    z <- apply(w, 1, function(p) sample.int(K, 1, prob = p))
+    
+    # --- store after burn-in ---
+    if (t > burn_in) {
+      store_idx <- store_idx + 1
+      keep$pi[store_idx, ] <- pi
+      keep$mu[store_idx, ] <- mu
+      keep$lambda[store_idx, ] <- lambda
+      keep$z[store_idx, ] <- z
+    }
+  }
+  
+  keep
+}
+
+
+```
+
+### Collapsed Gibbs
+
+```{r}
+dt_locscale <- function(x, df, mean = 0, sd = 1, log = FALSE) {
+  z <- (x - mean) / sd
+  dens <- dt(z, df = df, log = log)
+  if (log) dens - log(sd) else dens / sd
+}
+
+collapsed_labels <- function(x, K, alpha, m0, kappa0, a0, b0,
+                             n_iter = 2000, burn_in = 1000) {
+  N <- length(x)
+  total_iter <- n_iter + burn_in
+
+  # init labels randomly
+  z <- sample.int(K, N, replace = TRUE)
+
+  keep <- list(
+    pi = matrix(NA_real_, nrow = n_iter, ncol = K),
+    z  = matrix(NA_integer_, nrow = n_iter, ncol = N)
+  )
+
+  # helper: LOO predictive for x[i] under cluster k
+  loo_pred_one <- function(i, k, z_cur) {
+    idx <- which(z_cur == k & seq_along(z_cur) != i)
+    nk  <- length(idx)
+    if (nk == 0) {
+      # prior predictive t
+      nu <- 2 * a0
+      s2 <- (b0 / a0) * ((kappa0 + 1) / kappa0)   # variance
+      s  <- sqrt(s2)
+      dt_locscale(x[i], df = nu, mean = m0, sd = s, log = TRUE)
+    } else {
+      xk    <- x[idx]; xbar <- mean(xk)
+      kappa <- kappa0 + nk
+      m     <- (kappa0 * m0 + nk * xbar) / kappa
+      a     <- a0 + nk / 2
+      sse   <- sum((xk - xbar)^2)
+      b     <- b0 + 0.5 * (sse + (kappa0 * nk * (xbar - m0)^2) / kappa)
+      nu    <- 2 * a
+      s2    <- (b / a) * ((kappa + 1) / kappa)    # variance
+      s     <- sqrt(s2)
+      dt_locscale(x[i], df = nu, mean = m, sd = s, log = TRUE)
+    }
+  }
+
+  for (t in 1:total_iter) {
+
+    # single-site collapsed label updates
+    for (i in 1:N) {
+      # compute Nk_-i
+      Nk <- tabulate(z[-i], nbins = K)
+
+      # log prior (collapsed π): log(Nk_-i + alpha_k)
+      log_prior <- log(Nk + alpha)
+
+      # log predictive for each k
+      log_pred <- vapply(1:K, function(k) loo_pred_one(i, k, z), numeric(1))
+
+      # combine & normalize (log-sum-exp)
+      lw <- log_prior + log_pred
+      m  <- max(lw)
+      p  <- exp(lw - m)
+      p  <- p / sum(p)
+
+      z[i] <- sample.int(K, 1, prob = p)
+    }
+
+    # non-collapsed draw conditional on z
+    Nk_full <- tabulate(z, nbins = K)
+    pi_draw <- as.vector(MCMCpack::rdirichlet(1, alpha + Nk_full))
+
+    if (t > burn_in) {
+      idx <- t - burn_in
+      keep$pi[idx, ] <- pi_draw
+      keep$z[idx, ]  <- z
+    }
+  }
+  keep
+}
+
+
+```
+
+### Run Gibbs Samplers
+
+```{r}
+#initial setting
+a_ini <- 3; b_ini <-3
+kappa_ini <- 0.5
+m_ini <- 0
+
+# run samplers
+b_keep <- blocked_gibbs(x, K, alpha, m_ini, kappa_ini, a_ini, b_ini, n_iter = 10000)
+
+# final clustering by MAP of last iteration (for a quick plot)
+z_blocked   <- b_keep$z[nrow(b_keep$z), ]
+
+# trace of component sizes (compare mixing)
+Nk_trace_blocked <- t(apply(b_keep$z, 1, function(z) tabulate(z, K)))
+matplot(Nk_trace_blocked, type = "l", lty = 1, main = "Nk trace — blocked", ylab = "count")
+
+
+```
+
+```{r}
+
+c_keep <- collapsed_labels(x, K, alpha, m_ini, kappa_ini, a_ini, b_ini, n_iter = 10000)
+
+z_collapsed <- c_keep$z[nrow(c_keep$z), ]
+
+
+Nk_trace_collapsed <- t(apply(c_keep$z, 1, function(z) tabulate(z, K)))
+matplot(Nk_trace_collapsed, type = "l", lty = 1, main = "Nk trace — collapsed", ylab = "count")
+
+```
+
+### Diagnostic
+
+```{r}
+
+Nk_trace <- function(Z, K) {
+  # Z: iterations x N matrix of labels
+  t(apply(Z, 1, function(z) tabulate(z, nbins = K)))
+}
+
+Nk_b <- Nk_trace(b_keep$z, K)
+Nk_c <- Nk_trace(c_keep$z, K)
+
+matplot(Nk_b, type="l", lty=1, main="Cluster sizes Nk — Blocked", ylab="count", xlab="iter")
+
+matplot(Nk_c, type="l", lty=1, main="Cluster sizes Nk — Collapsed", ylab="count", xlab="iter")
+par(mfrow=c(1,1))
+
+
+acf(Nk_b[,1], main="ACF Nk[1] — Blocked")
+acf(Nk_c[,1], main="ACF Nk[1] — Collapsed")
+
+
+par(mar = c(4, 4, 2, 1))  # bottom, left, top, right
+for (k in 1:K) {
+  db <- density(Nk_b[,k])
+  dc <- density(Nk_c[,k])
+  plot(db, col="blue", lwd=2, main=paste0("Nk[",k,"]"), xlab="size", ylab="density")
+  lines(dc, col="red", lwd=2)
+  legend("topright", c("Blocked","Collapsed"), col=c("blue","red"), lwd=2, bty="n")
+}
+par(mfrow=c(1,1))
+
+
+```
+
+## Question 3.1 - Mini Report
+
+```{r}
+
+data <- read.csv(
+  "/Users/dolly/Desktop/Probablistic Models and Machine Learning/Homework/HW1/brand_matrix.csv",
+  header = TRUE,
+  row.names = 1
+)
+
+
+dim(data)   # Summary statistics
+row_sums <- rowSums(data); head(row_sums)
+col_sums <- colSums(data); head(col_sums) #Each person's vote
+
+data
+
+
+```
+
+#### Set hyperparameter
+
+```{r}
+# Number of clusters and brands
+K <- 20
+D <- ncol(data)  
+
+# Hyperparameters
+alpha0 <- 1.0
+beta0 <- 0.5
+
+alpha <- rep(alpha0, K)
+beta <- rep(beta0, D)
+
+```
+
+```{r}
+dmm_gibbs <- function(
+  X,
+  K = 20,
+  alpha = rep(1, 20),
+  beta = rep(0.5, 20),
+  n_iter = 2000,
+  burn_in = 1000,
+  seed = 123
+) {
+  set.seed(seed)
+  if (!requireNamespace("gtools", quietly = TRUE)) {
+    stop("Please install gtools: install.packages('gtools')")
+  }
+
+  # --- Basic setup ---
+  X <- as.matrix(X)
+  N <- nrow(X)
+  D <- ncol(X)
+
+  n_save <- floor(n_iter - burn_in)
+
+  # --- Storage ---
+  z_trace <- matrix(0, nrow = N, ncol = n_save)
+  pi_trace <- matrix(0, nrow = K, ncol = n_save)
+  phi_trace <- array(0, dim = c(K, D, n_save))
+
+  # --- Initialization ---
+  z <- sample(1:K, N, replace = TRUE)
+  Nk <- as.numeric(table(factor(z, levels = 1:K)))
+  Ckj <- matrix(0, nrow = K, ncol = D)
+  for (k in 1:K) {
+    if (Nk[k] > 0) {
+      Ckj[k, ] <- colSums(X[z == k, , drop = FALSE])
+    }
+  }
+
+  phi <- matrix(0, nrow = K, ncol = D)
+  for (k in 1:K) {
+    phi[k, ] <- as.numeric(gtools::rdirichlet(1, beta + Ckj[k, ]))
+  }
+  pi <- as.numeric(gtools::rdirichlet(1, alpha + Nk))
+
+  save_idx <- 0
+
+  # --- Gibbs Sampler ---
+  for (iter in 1:n_iter) {
+
+    ## 1. Update z_i
+    for (i in 1:N) {
+      current_k <- z[i]
+      Nk[current_k] <- Nk[current_k] - 1
+      Ckj[current_k, ] <- Ckj[current_k, ] - X[i, ]
+
+      log_w <- rep(0, K)
+      for (k in 1:K) {
+        log_w[k] <- log(pi[k]) + sum(X[i, ] * log(phi[k, ] + 1e-12))
+      }
+      log_w <- log_w - max(log_w)
+      w <- exp(log_w)
+      w <- w / sum(w)
+
+      new_k <- sample(1:K, size = 1, prob = w)
+      z[i] <- new_k
+
+      Nk[new_k] <- Nk[new_k] + 1
+      Ckj[new_k, ] <- Ckj[new_k, ] + X[i, ]
+    }
+
+    ## 2. Update phi_k
+    for (k in 1:K) {
+      phi[k, ] <- as.numeric(gtools::rdirichlet(1, beta + Ckj[k, ]))
+    }
+
+    ## 3. Update pi
+    pi <- as.numeric(gtools::rdirichlet(1, alpha + Nk))
+
+    ## 4. Save after burn-in
+    if (iter > burn_in) {
+        save_idx <- save_idx + 1
+        z_trace[, save_idx] <- z
+        pi_trace[, save_idx] <- pi
+        phi_trace[, , save_idx] <- phi
+    }
+
+
+    if (iter %% 1000 == 0) {
+      cat(sprintf("Iter %d/%d | cluster sizes: %s\n",
+                  iter, n_iter, paste(Nk, collapse = " ")))
+    }
+  }
+
+  # --- Return ---
+  out <- list(
+    z_trace = z_trace,
+    pi_trace = pi_trace,
+    phi_trace = phi_trace,
+    z_final = z,
+    pi_final = pi,
+    phi_final = phi,
+    Nk_final = Nk,
+    alpha0 = alpha,
+    beta0 = beta,
+    K = K,
+    n_iter = n_iter,
+    burn_in = burn_in
+  )
+  class(out) <- "DMM_Gibbs"
+  return(out)
+}
+
+```
+
+```{r}
+
+fit <- dmm_gibbs(
+  X = data,
+  K = K,
+  alpha = alpha,
+  beta = beta,
+  n_iter = 10000,
+  burn_in = 1000,
+  seed = 42
+)
+
+# Check results
+fit$Nk_final         # final cluster sizes
+head(fit$z_final)    # final cluster assignments
+fit$pi_final         # final mixture weights
+
+# Posterior means
+pi_est <- rowMeans(fit$pi_trace)
+phi_est <- apply(fit$phi_trace, c(1, 2), mean)
+
+# Top brands per cluster
+top_brands <- lapply(1:fit$K, function(k) order(-phi_est[k, ])[1:10])
+top_brands[[1]]  # top 10 brands for cluster 1
+
+
+```
+
+```{r}
+cat("The top 10 brands in cluster 1:")
+names(data)[top_brands[[1]]]
+
+cat("The top 10 brands in cluster 9:")
+names(data)[top_brands[[9]]]
+
+cat("The top 10 brands in cluster 19:")
+names(data)[top_brands[[19]]]
+
+```
+
+### Diagnostics
+
+```{r}
+# Nk over saved iterations
+Nk_trace <- t(apply(fit$z_trace, 2, function(z) tabulate(z, nbins = fit$K)))
+
+matplot(Nk_trace, type = "l", lty = 1, xlab = "Saved iteration",
+        ylab = "Cluster size", main = "Trace of Nk")
+legend("topright", legend = paste0("k=", 1:fit$K), col = 1:fit$K, lty = 1, cex = 0.6)
+
+
+
+# Example: ACF and ESS for Nk[:,1]
+acf(Nk_trace[, 19], main = "ACF of N19")
+effectiveSize(as.mcmc(Nk_trace[, 19]))  # ESS for N1
+
+
+
+```
+
+### ACF
+
+```{r}
+
+acf(Nk_trace[, 4], main="ACF for cluster 4 size")   # pick a few clusters
+effectiveSize(as.mcmc(Nk_trace[, 4]))
+
+acf(Nk_trace[, 10], main="ACF for cluster 10 size")   # pick a few clusters
+effectiveSize(as.mcmc(Nk_trace[, 10]))
+
+```
+
+#### ESS
+
+```{r}
+# Nk over saved iterations: matrix [S x K], S = #saved draws
+Nk_trace <- t(apply(fit$z_trace, 2, function(z) tabulate(z, nbins = fit$K)))
+
+# ESS for each cluster size
+ess_Nk <- apply(Nk_trace, 2, function(x) {
+  if (length(unique(x)) <= 1) return(0)  # constant → ESS = 0
+  effectiveSize(as.mcmc(x))
+})
+ess_Nk
+summary(ess_Nk)
+
+```
+
+```{r}
+# posterior mean of pi
+pi_means <- rowMeans(fit$pi_trace)
+barplot(pi_means, names.arg = 1:K, las = 2, 
+        main = "Posterior mean of mixture weights π",
+        ylab = "Mean π_k")
+
+pi_entropy <- function(p) -sum(p * log(pmax(p, 1e-12)))
+H_trace <- apply(fit$pi_trace, 2, pi_entropy)
+plot(H_trace, type="l", main="Entropy of π over iterations",
+     ylab="Entropy", xlab="Iteration")
+
+
+phi_mean <- apply(fit$phi_trace, c(1,2), mean)
+# top 10 brands for cluster 4
+order(phi_mean[4, ], decreasing = TRUE)[1:10]
+
+```
